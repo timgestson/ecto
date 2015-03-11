@@ -1,6 +1,7 @@
 defmodule Ecto.Adapters.Mnesia do
   @behaviour Ecto.Adapter.Storage
-  
+  require Logger
+
   def storage_up(opts) do
     username = Keyword.fetch!(opts, :username)
     host = Keyword.fetch!(opts, :hostname)
@@ -75,13 +76,19 @@ defmodule Ecto.Adapters.Mnesia do
   end
 
 
-  def start_link(repo, options) do
-    GenServer.start_link(__MODULE__, [repo, options])
+  def start_link(repo, opts) do
+    GenServer.start_link(__MODULE__, [repo, opts])
   end
 
-  def init([repo, options]) do
+  def init([repo, opts]) do
+    setup(repo)
     :mnesia.start
-    {:ok, [repo, options]}
+    tables = :mnesia.system_info(:tables)
+      |> Enum.map(fn(table)->
+        {table, :mnesia.table_info(table, :attributes)}
+      end)
+      |> Enum.into(HashDict.new)
+    {:ok, tables}
   end
 
 
@@ -102,7 +109,7 @@ defmodule Ecto.Adapters.Mnesia do
  
 
   defp from(sources) do
-    {table, _name, _model} = elem(sources, 0)
+    {table, _name, model} = elem(sources, 0)
     table = :mnesia.table(String.to_atom(table))
   end
 
@@ -119,6 +126,21 @@ defmodule Ecto.Adapters.Mnesia do
   #end
 
 
+  def insert(repo, source, fields, returning, opts) do
+    table = String.to_atom source
+    attributes = :mnesia.table_info(table, :attributes)
+    attributes |> Enum.each &Logger.info/1
+    insert_list = attributes
+    |> Enum.map(fn(field)->
+      Keyword.get(fields, field, nil)
+    end)
+ 
+    insert_record = :erlang.list_to_tuple([table | insert_list])
+    :mnesia.write(insert_record)
+    [_ | values ] = insert_list
+    {:ok, Keyword.new}
+  end
+
   defp create_names(query) do
     sources = query.sources |> Tuple.to_list
     Enum.reduce(sources, [], fn {table, model}, names ->
@@ -126,7 +148,7 @@ defmodule Ecto.Adapters.Mnesia do
       [{table, name, model}|names]
     end) |> Enum.reverse
   end
-  
+
   # Brute force find unique name
   defp unique_name(names, name, counter) do
     counted_name = name <> Integer.to_string(counter)
@@ -137,6 +159,10 @@ defmodule Ecto.Adapters.Mnesia do
       end
   end
    
+  defp get_model_ordering(model) do
+    model.__schema__(:fields)
+  end
+
   # DDL
 
   alias Ecto.Migration.Table
@@ -146,15 +172,11 @@ defmodule Ecto.Adapters.Mnesia do
   def supports_ddl_transaction?, do: false
 
   def ddl_exists?(_repo, %Table{name: name}, _opts) do
-    case :mnesia.transaction(fn->
-      :mnesia.table_info(name, :all) 
-    end) do
-      {:aborted, {:no_exists, _, _}} -> false
-      _ -> true
-    end
+    :mnesia.system_info(:tables) |> Enum.member?(name)
   end
 
-  def execute_ddl(_repo, {:create, %Table{name: name}, columns}, opts) do
+  def execute_ddl(repo, {:create, %Table{name: name}, columns}, opts) do
+    setup(repo)
     :mnesia.create_table(name, create_attributes(columns))
     |> atomic_response
   end
@@ -165,22 +187,29 @@ defmodule Ecto.Adapters.Mnesia do
   end
 
   defp create_attributes(columns) do
-    attributes = []
-  
-    Enum.each(columns, fn {:add, column, _type, opts} when is_atom(column)->
+    attributes = Enum.reduce(columns, [], fn 
+      {:add, column, _type, opts}, acc when is_atom(column)->
         if Keyword.get(opts, :primary_key) do
-          List.insert_at(attributes, column, 0)
+          List.insert_at(acc, 0, column)
         else
-          List.insert_at(attributes, column, -1)
+          List.insert_at(acc, -1, column)
         end
-    end)
-    [attributes: attributes]
+      end)
+    [attributes: attributes, disc_copies: [Node.self]]
   end
 
   defp atomic_response({:atomic, result}), do: result
   
   defp atomic_response({:aborted, reason}), do: reason
 
+  defp setup(repo) do
+    opts = repo.config
+    username = Keyword.fetch!(opts, :username)
+    host = Keyword.fetch!(opts, :hostname)
+    hostname = String.to_atom("#{username}@#{host}")
+    Logger.info(hostname)
+    :net_kernel.start([hostname, :shortnames])
+  end
 end
 
 
